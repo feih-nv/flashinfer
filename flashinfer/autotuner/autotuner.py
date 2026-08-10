@@ -769,6 +769,9 @@ def autotune(
         with tuner._lock:
             tuner._file_configs.clear()
             tuner._logged_file_hits.clear()
+            # Shortlists are process-local; a newly loaded cache file may
+            # disagree with rankings from an earlier in-process tune.
+            tuner._ranked_tactics_cache.clear()
         if os.path.isfile(cache):
             tuner.load_configs(cache)
 
@@ -1792,20 +1795,20 @@ class AutoTuner:
                     f"while ranking '{custom_op}'"
                 ) from e
 
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = list(tuning_config.inputs_pre_hook(tensors))
+
             cache_key = AutoTuner._get_cache_key(
                 custom_op,
                 runner,
                 profile.get_opt_shapes(),
                 tuning_config,
-                runner.get_cache_key_extras(inputs),
+                runner.get_cache_key_extras(tensors),
             )
             cached_ranking = self._ranked_tactics_cache.get(cache_key)
             if cached_ranking is not None:
                 return list(cached_ranking[:k])
-
-            tensors = self._prepare_input_tensors(profile, inputs)
-            if tuning_config.inputs_pre_hook is not None:
-                tensors = list(tuning_config.inputs_pre_hook(tensors))
 
             valid_tactics = runner.get_valid_tactics(tensors, profile)
             valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
@@ -2498,6 +2501,7 @@ class AutoTuner:
 
         skipped_legacy_cudnn_tactics = 0
         with self._lock:
+            self._ranked_tactics_cache.clear()
             for key, value in configs.items():
                 runner_name = value[0]
                 tactic = _json_to_tactic(value[1])
