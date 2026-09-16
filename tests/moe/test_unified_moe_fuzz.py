@@ -928,15 +928,15 @@ def _semantic_reference(
     return out
 
 
-def _dequant_cutlass_nvfp4(packed, scale):
+def _dequant_cutlass_nvfp4(packed, scale, swizzled=True):
     rows, packed_cols = packed.shape
     return e2m1_and_ufp8sf_scale_to_float(
         packed.cpu(),
-        scale.cpu().reshape(-1),
+        scale.cpu().view(torch.uint8).reshape(-1),
         torch.ones(1, dtype=torch.float32),
         16,
         1,
-        True,
+        swizzled,
     ).view(rows, packed_cols * 2)
 
 
@@ -998,11 +998,12 @@ def _cutlass_post_reference(backend_key):
     ):
         x_ref, w1_ref, w2_ref = x, w1, w2
         if backend_key == "cutlass_nvfp4":
+            # Same canonical pack as _nvfp4_act_pack: linear block scales.
             one = torch.ones(1, device=x.device)
             x_q, x_sf = fp4_quantize(
-                x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=True
+                x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=False
             )
-            x_ref = _dequant_cutlass_nvfp4(x_q, x_sf).to(x.device)
+            x_ref = _dequant_cutlass_nvfp4(x_q, x_sf, swizzled=False).to(x.device)
             w1_ref = _dequant_cutlass_nvfp4_experts(
                 view["fc1_expert_weights"], view["fc1_weight_block_scale"], x.device
             )
@@ -1030,7 +1031,7 @@ def _cutlass_post_reference(backend_key):
             x_ref = mxfp8_dequantize_host(
                 view["_activation_q"].cpu().view(torch.uint8),
                 view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
-                True,
+                view["_activation_scale"].ndim == 1,
             ).to(x.device)
             w1_ref = torch.stack(
                 [
@@ -1062,7 +1063,7 @@ def _cutlass_post_reference(backend_key):
             x_ref = mxfp8_dequantize_host(
                 view["_activation_q"].cpu().view(torch.uint8),
                 view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
-                True,
+                view["_activation_scale"].ndim == 1,
             ).to(x.device)
             # Re-quantize independently from the canonical weights instead of
             # consuming the prepared scale view. This catches a broken
@@ -1279,7 +1280,7 @@ _CONTRACT_HANDLERS = {
     "cutlass_nvfp4": _contract_handler(
         CutlassNvfp4Config,
         "nvfp4",
-        activation_pack=_contract_bf16_act_pack,
+        activation_pack=_nvfp4_act_pack,
         reference=_cutlass_post_reference("cutlass_nvfp4"),
         snap=_snap_to_nvfp4,
         atol_frac=0.15,
