@@ -42,7 +42,6 @@ config = MoEConfig(
     ),
     quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    # NVFP4 activation packs are backend-native; choose one candidate set.
     backends=[TrtllmFp4Config(extra_backend_params...)],
 )
 # --- Find possible backends ---
@@ -122,11 +121,9 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates are valid only when they consume the same activation
-# pack contract. NVFP4 TRT-LLM and CUTLASS require different packs, so select
-# either singleton candidate set explicitly.
-backends = [TrtllmFp4Config()]
-# or: backends = [CutlassNvfp4Config()]
+# Multiple candidates share one MoEActivationPack: for each MMA pair every
+# backend consumes the TRT-LLM canonical pack (see MoEActivationPack).
+backends = [TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -725,7 +722,7 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path. CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). Weight views are backend-native: CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path, and CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Activation packs are not: for a given MMA pair every backend consumes the TRT-LLM canonical `MoEActivationPack`, so `Xxx.prepare_activations` helpers of different backends for the same pair are interchangeable. Two exceptions: b12x / cuTile NVFP4 take BF16 activations and quantize in-kernel (a different pack from the pre-quantized NVFP4 backends, see `MoEActivationPack`), and the opt-in `QuantConfig(swizzled_scale_factors=True)` selects the flat CUTLASS swizzled MXFP8 `input_sf`, which only the CUTLASS MXFP8 runners consume, so a mixed candidate set must use the (default) linear layout. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
@@ -1080,6 +1077,29 @@ crosses the Python API.
 `output` defaults to BF16 and every current runner declares
 `supported_output_formats == (BF16,)`, so the activation matrix is keyed by the
 `weight×activation` pair only.
+
+### CUTLASS runners consume the TRT-LLM canonical activation pack (2026-09)
+
+Weight views are per-backend (keyed by `backend_key`), but a call carries one
+`MoEActivationPack`, so every candidate for an MMA pair must agree on its
+encoding. The unified CUTLASS NVFP4 runner originally took BF16 and quantized
+in-kernel, and CUTLASS MXFP8 required the flat 128x4-swizzled `input_sf`; each
+made `(TrtllmXxxConfig(), CutlassXxxConfig())` fail at `pack_inputs`. The flat
+`cutlass_fused_moe` already accepts pre-quantized NVFP4 and linear scales, so
+the runners now consume the canonical packs with no kernel change:
+
+- NVFP4×NVFP4: packed `uint8 [M, H/2]` + linear E4M3 `[M, H/16]`, unit global
+  scale (`CutlassNvfp4Config.prepare_activations` ==
+  `TrtllmFp4Config.prepare_activations`).
+- MXFP8 (both pairs): linear `[M, H/32]` by default; the previously
+  declared-but-rejected `QuantConfig(swizzled_scale_factors=True)` selects the
+  flat swizzled buffer. `Cutlass*Config.prepare_activations(...,
+  swizzled_scale_factors=True)` produces it.
+
+CUTLASS per-tensor FP8 still takes a dynamic scalar dequant scale on the pack
+(TRT-LLM keeps its static multipliers in the weight view); aligning it is a
+separate change. b12x / cuTile NVFP4 still take BF16 activations and quantize in-kernel; they
+are not in the same candidate sets as the pre-quantized NVFP4 backends.
 
 ### Explicit Non-Goals For This MVP
 
