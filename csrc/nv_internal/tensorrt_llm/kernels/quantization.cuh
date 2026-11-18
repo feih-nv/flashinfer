@@ -276,6 +276,13 @@ quantize_with_block_size(
   // POSITIVE CONTROL (repro only): trigger dependents right after the wait, so the whole kernel is
   // the race window.
   asm volatile("griddepcontrol.launch_dependents;");
+  {
+    // POSITIVE CONTROL (repro only): hold this CTA's stores back ~200 us after the trigger, so a
+    // dependent GEMM that starts early must read stale scale factors.
+    long long const t0 = clock64();
+    while (clock64() - t0 < 400000LL) {
+    }
+  }
 
   // Get the caller-provided global scaling factor, which will be applied to the SF.
   float SFScaleVal = 1.0f;
