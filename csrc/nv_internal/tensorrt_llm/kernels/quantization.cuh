@@ -273,6 +273,9 @@ quantize_with_block_size(
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
   asm volatile("griddepcontrol.wait;" ::: "memory");
+  // POSITIVE CONTROL (repro only): trigger dependents right after the wait, so the whole kernel is
+  // the race window.
+  asm volatile("griddepcontrol.launch_dependents;");
 
   // Get the caller-provided global scaling factor, which will be applied to the SF.
   float SFScaleVal = 1.0f;
@@ -465,7 +468,6 @@ quantize_with_block_size(
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
