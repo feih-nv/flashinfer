@@ -17,16 +17,20 @@ Design (round 4):
 - the reference runs quantize and GEMM with a ``torch.cuda.synchronize()``
   between them (the no-PDL "reference" of earlier rounds raced as well: the
   producer always triggers and the GEMM is always a PDL launch);
-- eager mode enqueues a ~100 us filler kernel before each pair so both
-  launches are queued before the quantize runs; graph mode replays one graph
+- eager mode enqueues a few milliseconds of filler GEMMs before each pair so
+  both launches are queued before the quantize runs (the host side of the two
+  FlashInfer calls is a few hundred microseconds); the loop time and the final
+  synchronize time are printed so a run without backlog is visible; graph mode replays one graph
   whose static input is refilled between replays.
 
 Any element differing from the reference, or any NaN, is a hit.
-``NVFP4_PDL_REPRO_ITERS`` sets the iterations per case (default 100000);
+``NVFP4_PDL_REPRO_ITERS`` sets the iterations per graph case (default 100000;
+eager cases run a fifth of it because of the filler);
 ``NVFP4_PDL_REPRO_ANY_SM=1`` runs on other architectures (API check only).
 """
 
 import os
+import time
 
 import pytest
 import torch
@@ -67,8 +71,8 @@ def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
     gs_w = (448 * 6) / w.float().abs().max()
     w_fp4, w_sf = nvfp4_quantize(w, gs_w, sfLayout=SfLayout.layout_128x4)
     alpha = 1.0 / (gs_x * gs_w)
-    filler_a = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
-    filler_out = torch.empty(4096, 4096, device=device, dtype=torch.bfloat16)
+    filler_a = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
+    filler_out = torch.empty(8192, 8192, device=device, dtype=torch.bfloat16)
 
     def gemm(a_fp4, a_sf, out):
         mm_fp4(
@@ -120,22 +124,35 @@ def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
                 pair(x_static, out)
         mismatches = torch.zeros((), device=device, dtype=torch.int64)
         nans = torch.zeros((), device=device, dtype=torch.int64)
-        for i in range(ITERS):
+        torch.cuda.synchronize()
+        t_loop = time.perf_counter()
+        iters = (
+            ITERS if graph else ITERS // 5
+        )  # eager pays ~2 ms of filler per iteration
+        for i in range(iters):
             cur = i & 1
             if graph:
                 x_static.copy_(inputs[cur])
                 g.replay()
             else:
-                torch.mm(
-                    filler_a, filler_a, out=filler_out
-                )  # ~100 us: both launches below queue up behind it
+                for _ in range(
+                    4
+                ):  # ~2 ms of GEMM: both launches below queue up behind it
+                    torch.mm(filler_a, filler_a, out=filler_out)
                 pair(inputs[cur], out)
             mismatches += (out != refs[cur]).any()
             nans += torch.isnan(out).any()
+    t_sync = time.perf_counter()
     torch.cuda.synchronize()
+    t_end = time.perf_counter()
     bad, nan = int(mismatches), int(nans)
-    print(
-        f"\n{_ids(shape)} {'graph' if graph else 'eager'}: {bad}/{ITERS} iterations differ from the "
-        f"synchronized reference, {nan} with NaN"
+    backlog = (
+        ""
+        if t_end - t_sync >= 0.05 * (t_sync - t_loop)
+        else " (no GPU backlog: launches were not queued ahead)"
     )
-    assert bad == 0, f"PDL race: {bad}/{ITERS} iterations differ ({nan} with NaN)"
+    print(
+        f"\n{_ids(shape)} {'graph' if graph else 'eager'}: {bad}/{iters} iterations differ from the "
+        f"synchronized reference, {nan} with NaN; loop {t_sync - t_loop:.1f}s, final sync {t_end - t_sync:.1f}s{backlog}"
+    )
+    assert bad == 0, f"PDL race: {bad}/{iters} iterations differ ({nan} with NaN)"
