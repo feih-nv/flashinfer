@@ -156,3 +156,86 @@ def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
         f"synchronized reference, {nan} with NaN; loop {t_sync - t_loop:.1f}s, final sync {t_end - t_sync:.1f}s{backlog}"
     )
     assert bad == 0, f"PDL race: {bad}/{iters} iterations differ ({nan} with NaN)"
+
+
+def test_pdl_overlap_trace():
+    """Measure, with the CUDA profiler, whether the GEMM starts before the quantize kernel ends.
+
+    Reports the median (GEMM start - quantize end) over 30 queued pairs through
+    ``pytest.fail`` so the numbers land in the JUnit report; negative means the
+    PDL launch overlapped. Run on the positive-control branch, overlap should be
+    close to -200 us.
+    """
+    device = torch.device("cuda")
+    if get_compute_capability(device) != (10, 3) and not os.environ.get(
+        "NVFP4_PDL_REPRO_ANY_SM"
+    ):
+        pytest.skip("The unguarded main_sf_load is the SM103 CUTLASS kernel")
+    m, n, k = 8, 4096, 7168
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+    gs_x = torch.tensor(448 * 6 / 6.0, device=device)
+    gs_w = (448 * 6) / w.float().abs().max()
+    w_fp4, w_sf = nvfp4_quantize(w, gs_w, sfLayout=SfLayout.layout_128x4)
+    alpha = 1.0 / (gs_x * gs_w)
+    out = torch.empty(m, n, device=device, dtype=torch.bfloat16)
+    filler_a = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
+    filler_out = torch.empty_like(filler_a)
+
+    def pair():
+        a_fp4, a_sf = nvfp4_quantize(
+            x, gs_x, sfLayout=SfLayout.layout_128x4, enable_pdl=True
+        )
+        mm_fp4(
+            a_fp4,
+            w_fp4.T,
+            a_sf,
+            w_sf.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+            use_nvfp4=True,
+        )
+
+    for _ in range(3):
+        pair()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        for _ in range(30):
+            for _ in range(4):
+                torch.mm(filler_a, filler_a, out=filler_out)
+            pair()
+        torch.cuda.synchronize()
+    events = sorted(
+        (
+            (e.start_ns(), e.start_ns() + e.duration_ns(), e.name())
+            for e in prof.profiler.kineto_results.events()
+            if e.device_type() == torch.autograd.DeviceType.CUDA and e.duration_ns() > 0
+        ),
+        key=lambda t: t[0],
+    )
+    gaps = []
+    for (qs, qe, qn), (gs, ge, gn) in zip(events, events[1:], strict=False):
+        if "quantize_with_block_size" in qn and "device_kernel" in gn:
+            gaps.append(
+                (gs - qe) / 1000.0,
+            )
+            gaps[-1] = ((gs - qe) / 1000.0, (qe - qs) / 1000.0, (ge - gs) / 1000.0)
+    if not gaps:
+        pytest.fail(
+            "no quantize->GEMM pairs found in the trace: "
+            + ", ".join(sorted({e[2][:40] for e in events}))
+        )
+    gaps_sorted = sorted(g[0] for g in gaps)
+    med = gaps_sorted[len(gaps_sorted) // 2]
+    pytest.fail(
+        f"PDL overlap trace over {len(gaps)} pairs: median GEMM start - quantize end = {med:.1f} us "
+        f"(min {gaps_sorted[0]:.1f}, max {gaps_sorted[-1]:.1f}); quantize {gaps[-1][1]:.1f} us, "
+        f"GEMM {gaps[-1][2]:.1f} us. Negative = the GEMM started before the quantize ended."
+    )
