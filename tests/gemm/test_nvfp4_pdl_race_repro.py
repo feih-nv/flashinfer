@@ -13,7 +13,7 @@ the quantization will write are poisoned with 0xFF (an E4M3 NaN scale) just
 before each call so a scale factor read before its store lands turns into a
 NaN in the output. Any mismatch or NaN over the iterations is a hit.
 
-``NVFP4_PDL_REPRO_ITERS`` sets the iterations per case (default 2000);
+``NVFP4_PDL_REPRO_ITERS`` sets the iterations per case (default 200000);
 ``NVFP4_PDL_REPRO_ANY_SM=1`` runs on other architectures (API check only).
 """
 
@@ -25,7 +25,7 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.utils import get_compute_capability
 
-ITERS = int(os.environ.get("NVFP4_PDL_REPRO_ITERS", "2000"))
+ITERS = int(os.environ.get("NVFP4_PDL_REPRO_ITERS", "200000"))
 # DeepSeek-R1 NVFP4 shapes (m tokens, n out, k in) plus a tall-skinny one.
 SHAPES = [
     (8192, 7168, 2048),
