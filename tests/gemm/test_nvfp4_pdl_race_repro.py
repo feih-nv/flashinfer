@@ -302,3 +302,112 @@ def test_quantize_then_cutlass_gemm_with_pdl_tactic_long(tactic, m, monkeypatch)
     assert bad == 0, (
         f"PDL race with tactic {tactic}, m={m}: {bad}/{iters} iterations differ ({nan} with NaN)"
     )
+
+
+# TMA producer x K768 consumer. quantize_with_block_size_tma (m >= 1024, input >= 32 MiB, work tiles >= SMs)
+# has a block-wide barrier only before its warp-role branches: the 31 non-elected lanes of warp 0 skip both
+# roles and reach griddepcontrol.launch_dependents immediately, so every CTA triggers at its start and the
+# window is the whole kernel. Rounds 1-6 never paired this producer with the K768 consumer.
+TMA_ROWS = [4096, 8192, 16384]
+TMA_TACTICS = [22, 36, 40, 44, 48, 53, 58, 62]
+TMA_ITERS = int(os.environ.get("NVFP4_PDL_REPRO_TMA_ITERS", "20000"))
+
+
+def _force_tactic(monkeypatch, tactic):
+    from flashinfer.autotuner import AutoTuner
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "choose_one",
+        lambda self, name, runners, cfg, inputs, **kw: (runners[0], tactic),
+    )
+
+
+@pytest.mark.parametrize("m", TMA_ROWS, ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("tactic", TMA_TACTICS, ids=lambda t: f"t{t}")
+def test_quantize_then_cutlass_gemm_with_pdl_tactic_tma(tactic, m, monkeypatch):
+    _skip_unless_sm103(torch.device("cuda"))
+    _force_tactic(monkeypatch, tactic)
+    monkeypatch.setitem(globals(), "ITERS", TMA_ITERS)
+    bad, nan, iters = _race_loop(
+        (m, 4096, 7168), True, f"tactic {tactic} {m}x4096x7168 (TMA producer)"
+    )
+    assert bad == 0, (
+        f"PDL race with tactic {tactic}, m={m}: {bad}/{iters} iterations differ ({nan} with NaN)"
+    )
+
+
+@pytest.mark.parametrize("tactic", [22, 36], ids=lambda t: f"t{t}")
+def test_pdl_overlap_trace_tma(tactic, monkeypatch):
+    """Which quantize kernel runs at m=8192 and whether the forced-tactic GEMM starts before it ends."""
+    device = torch.device("cuda")
+    _skip_unless_sm103(device)
+    _force_tactic(monkeypatch, tactic)
+    m, n, k = 8192, 4096, 7168
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+    gs_x = torch.tensor(448 * 6 / 6.0, device=device)
+    gs_w = (448 * 6) / w.float().abs().max()
+    w_fp4, w_sf = nvfp4_quantize(w, gs_w, sfLayout=SfLayout.layout_128x4)
+    alpha = 1.0 / (gs_x * gs_w)
+    out = torch.empty(m, n, device=device, dtype=torch.bfloat16)
+
+    def pair():
+        a_fp4, a_sf = nvfp4_quantize(
+            x, gs_x, sfLayout=SfLayout.layout_128x4, enable_pdl=True
+        )
+        mm_fp4(
+            a_fp4,
+            w_fp4.T,
+            a_sf,
+            w_sf.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+            use_nvfp4=True,
+        )
+
+    for _ in range(3):
+        pair()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        pair()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        for _ in range(30):
+            g.replay()
+        torch.cuda.synchronize()
+    events = sorted(
+        (
+            (e.start_ns(), e.start_ns() + e.duration_ns(), e.name())
+            for e in prof.profiler.kineto_results.events()
+            if e.device_type() == torch.autograd.DeviceType.CUDA and e.duration_ns() > 0
+        ),
+        key=lambda t: t[0],
+    )
+    producers = sorted(
+        {e[2][:60] for e in events if "quantize_with_block_size" in e[2]}
+    )
+    gaps = [
+        (gs - qe) / 1000.0
+        for (qs, qe, qn), (gs, ge, gn) in zip(events, events[1:], strict=False)
+        if "quantize_with_block_size" in qn and "device_kernel" in gn
+    ]
+    if not gaps:
+        pytest.fail(
+            "no quantize->GEMM pairs in the trace: "
+            + ", ".join(sorted({e[2][:40] for e in events}))
+        )
+    gaps.sort()
+    pytest.fail(
+        f"tactic {tactic}, m={m}: producer kernel(s) {producers}; over {len(gaps)} pairs median "
+        f"GEMM start - quantize end = {gaps[len(gaps) // 2]:.1f} us (min {gaps[0]:.1f}, max {gaps[-1]:.1f}). "
+        f"Negative = overlap."
+    )
