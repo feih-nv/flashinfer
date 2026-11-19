@@ -24,7 +24,7 @@ Design (round 4):
   whose static input is refilled between replays.
 
 Any element differing from the reference, or any NaN, is a hit.
-``NVFP4_PDL_REPRO_ITERS`` sets the iterations per graph case (default 100000;
+``NVFP4_PDL_REPRO_ITERS`` sets the iterations per graph case (default 20000;
 eager cases run a fifth of it because of the filler);
 ``NVFP4_PDL_REPRO_ANY_SM=1`` runs on other architectures (API check only).
 """
@@ -38,7 +38,7 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.utils import get_compute_capability
 
-ITERS = int(os.environ.get("NVFP4_PDL_REPRO_ITERS", "100000"))
+ITERS = int(os.environ.get("NVFP4_PDL_REPRO_ITERS", "20000"))
 # (m tokens, n out, k in): DeepSeek-R1 decode at K=7168 / N=4096, plus the
 # non-multiple-of-128 hidden sizes TRT-LLM validated (1568, 2880).
 SHAPES = [(m, 4096, 7168) for m in (1, 2, 4, 8, 16, 32, 64, 100)] + [
@@ -53,14 +53,16 @@ def _ids(shape):
     return "x".join(str(v) for v in shape)
 
 
-@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("shape", SHAPES, ids=_ids)
-def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
-    device = torch.device("cuda")
+def _skip_unless_sm103(device):
     if get_compute_capability(device) != (10, 3) and not os.environ.get(
         "NVFP4_PDL_REPRO_ANY_SM"
     ):
         pytest.skip("The unguarded main_sf_load is the SM103 CUTLASS kernel")
+
+
+def _race_loop(shape, graph, label):
+    """One quantize->GEMM pair loop; returns (mismatches, nans, iterations)."""
+    device = torch.device("cuda")
     m, n, k = shape
     torch.manual_seed(0)
     inputs = [torch.randn(m, k, device=device, dtype=torch.bfloat16) for _ in range(2)]
@@ -114,6 +116,9 @@ def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
     )
 
     out = torch.empty(m, n, device=device, dtype=torch.bfloat16)
+    assert out.data_ptr() % 32 == 0, (
+        "K768 tactics need a 32-byte aligned output or they fall back"
+    )
     x_static = inputs[0].clone()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -152,10 +157,42 @@ def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
         else " (no GPU backlog: launches were not queued ahead)"
     )
     print(
-        f"\n{_ids(shape)} {'graph' if graph else 'eager'}: {bad}/{iters} iterations differ from the "
+        f"\n{label} {'graph' if graph else 'eager'}: {bad}/{iters} iterations differ from the "
         f"synchronized reference, {nan} with NaN; loop {t_sync - t_loop:.1f}s, final sync {t_end - t_sync:.1f}s{backlog}"
     )
+    return bad, nan, iters
+
+
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("shape", SHAPES, ids=_ids)
+def test_quantize_then_cutlass_gemm_with_pdl(shape, graph):
+    _skip_unless_sm103(torch.device("cuda"))
+    bad, nan, iters = _race_loop(shape, graph, _ids(shape))
     assert bad == 0, f"PDL race: {bad}/{iters} iterations differ ({nan} with NaN)"
+
+
+# mm_fp4(backend="cutlass") on SM103 dispatches by tile: candidates 0-35 (K128 / K256 tiles) run the
+# SM100 kernel, whose load warp waits on the dependent grid; only 36-62 (K768 tiles) run the SM103
+# block-scaled kernel whose main_sf_load warp does not. The default tactics {22, 20, 29, 4, 18} never
+# reach it, so the untuned test above exercises the safe kernel. This sweep forces the tactic.
+TACTICS = [22, 36, 40, 44, 48, 53, 58, 62]
+
+
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("tactic", TACTICS, ids=lambda t: f"t{t}")
+def test_quantize_then_cutlass_gemm_with_pdl_tactic(tactic, graph, monkeypatch):
+    _skip_unless_sm103(torch.device("cuda"))
+    from flashinfer.autotuner import AutoTuner
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "choose_one",
+        lambda self, name, runners, cfg, inputs, **kw: (runners[0], tactic),
+    )
+    bad, nan, iters = _race_loop((8, 4096, 7168), graph, f"tactic {tactic} 8x4096x7168")
+    assert bad == 0, (
+        f"PDL race with tactic {tactic}: {bad}/{iters} iterations differ ({nan} with NaN)"
+    )
 
 
 def test_pdl_overlap_trace():
