@@ -276,3 +276,29 @@ def test_pdl_overlap_trace():
         f"(min {gaps_sorted[0]:.1f}, max {gaps_sorted[-1]:.1f}); quantize {gaps[-1][1]:.1f} us, "
         f"GEMM {gaps[-1][2]:.1f} us. Negative = the GEMM started before the quantize ended."
     )
+
+
+# Long run on the exposed kernel only: every K768 tactic, three decode row counts, graph replay
+# (about 50 us per pair, so 500k pairs per case in under a minute).
+LONG_ITERS = int(os.environ.get("NVFP4_PDL_REPRO_LONG_ITERS", "500000"))
+K768_TACTICS = list(range(36, 63))
+
+
+@pytest.mark.parametrize("m", [1, 8, 64], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("tactic", K768_TACTICS, ids=lambda t: f"t{t}")
+def test_quantize_then_cutlass_gemm_with_pdl_tactic_long(tactic, m, monkeypatch):
+    _skip_unless_sm103(torch.device("cuda"))
+    from flashinfer.autotuner import AutoTuner
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "choose_one",
+        lambda self, name, runners, cfg, inputs, **kw: (runners[0], tactic),
+    )
+    monkeypatch.setitem(globals(), "ITERS", LONG_ITERS)
+    bad, nan, iters = _race_loop(
+        (m, 4096, 7168), True, f"tactic {tactic} {m}x4096x7168"
+    )
+    assert bad == 0, (
+        f"PDL race with tactic {tactic}, m={m}: {bad}/{iters} iterations differ ({nan} with NaN)"
+    )
