@@ -168,8 +168,8 @@ def _run_correctness_worker(
                     )
 
                     torch_before_residual = (
-                        expert_reduction + shared_expert_output
-                    ) * world_size
+                        expert_reduction + shared_expert_output.float()
+                    ).to(dtype) * world_size
                     torch_residual = torch_before_residual + residual
                     torch_residual = torch_residual.to(torch.float32)
                     torch_output_hidden_states = rms_norm(

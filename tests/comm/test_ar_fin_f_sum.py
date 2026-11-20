@@ -160,8 +160,6 @@ def _run_correctness_worker(
                     torch.cuda.synchronize()
 
                     # == Calculate reference output ==
-                    # The kernel accumulates the top-k terms and the shared expert in fp32
-                    # and rounds once; the reference does the same.
                     expert_reduction = torch.sum(
                         fc2_output_clone[expanded_idx_to_permuted_idx].float()
                         * scale.unsqueeze(-1).float()
@@ -170,8 +168,8 @@ def _run_correctness_worker(
                     )
 
                     torch_before_residual = (
-                        expert_reduction + shared_expert_output.float()
-                    ).to(dtype) * world_size
+                        expert_reduction + shared_expert_output
+                    ) * world_size
                     torch_residual = torch_before_residual + residual
                     torch_residual = torch_residual.to(torch.float32)
                     torch_output_hidden_states = rms_norm(
