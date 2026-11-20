@@ -72,7 +72,8 @@ def _run_correctness_worker(
                 dist.barrier(group=group)
                 test_passed = True
                 print(
-                    f"test RANK {rank}: seq_len{seq_len}-topk{top_k}-tp{world_size}-{dtype}-pdl{launch_with_pdl} start"
+                    f"test RANK {rank}: seq_len{seq_len}-topk{top_k}-tp{world_size}-{dtype}-pdl{launch_with_pdl} start",
+                    flush=True,
                 )
                 dist.barrier(group=group)
                 torch.cuda.synchronize()
@@ -100,7 +101,7 @@ def _run_correctness_worker(
                         seq_len * hidden_size // 4, dtype=dtype, device=device
                     )
                     scale_out = torch.empty(
-                        seq_len * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
+                        128 * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
                     )
                     routed_scaling_factor = 2.5
 
@@ -158,11 +159,14 @@ def _run_correctness_worker(
                     g.replay()
 
                     torch.cuda.synchronize()
+                    print(f"RANK {rank} pdl{launch_with_pdl} sync-ok", flush=True)
 
                     # == Calculate reference output ==
+                    # The kernel accumulates the top-k terms and the shared expert in fp32
+                    # and rounds once; the reference does the same.
                     expert_reduction = torch.sum(
-                        fc2_output_clone[expanded_idx_to_permuted_idx]
-                        * scale.unsqueeze(-1)
+                        fc2_output_clone[expanded_idx_to_permuted_idx].float()
+                        * scale.unsqueeze(-1).float()
                         * routed_scaling_factor,
                         dim=1,
                     )
